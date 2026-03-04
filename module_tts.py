@@ -3,13 +3,11 @@ import re
 import wave
 import ctypes
 import asyncio
-import subprocess
 from io import BytesIO
 from piper.voice import PiperVoice
 from modules.module_messageQue import queue_message
 
 # --- 1. SILENCIADOR DE ERRORES ALSA ---
-# Magia oscura de Linux para que la terminal no se llene de advertencias de audio inútiles.
 ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
 def py_error_handler(filename, line, function, err, fmt): pass
 c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
@@ -20,7 +18,6 @@ except:
     pass
 
 # --- 2. PRECARGA DEL MODELO EN RAM ---
-# Esto elimina el retraso de 7 segundos cargando a 'Dave' directamente en la memoria.
 MODEL_PATH = "/home/javiersg/TARS-AI/src/assets/voices/es_ES-davefx-medium.onnx"
 voice = None
 
@@ -34,13 +31,13 @@ try:
 except Exception as e:
     print(f"❌ Error crítico cargando el motor Piper: {e}")
 
-# --- 3. MOTOR DE SÍNTESIS ---
-async def synthesize(chunk):
-    """Convierte un fragmento de texto en un archivo WAV temporal en la memoria RAM."""
+# --- 3. SÍNTESIS SÍNCRONA (Para usar en hilos de fondo) ---
+def synthesize_sync(chunk):
+    """Genera el audio usando la CPU. Se ejecutará en un hilo separado para no bloquear."""
     wav_buffer = BytesIO()
     with wave.open(wav_buffer, 'wb') as wav_file:
-        wav_file.setnchannels(1)  # Mono
-        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setnchannels(1)  
+        wav_file.setsampwidth(2)  
         wav_file.setframerate(voice.config.sample_rate)
         
         try:
@@ -49,50 +46,55 @@ async def synthesize(chunk):
             elif hasattr(voice, "synthesize"):
                 voice.synthesize(chunk, wav_file)
         except Exception as e:
-            queue_message(f"Error de síntesis interna: {e}")
+            print(f"Error de síntesis: {e}")
             
     wav_buffer.seek(0)
     return wav_buffer
 
-# --- 4. FUNCIÓN PRINCIPAL DE REPRODUCCIÓN (STREAMING) ---
+# --- 4. STREAMING ASÍNCRONO SIN CORTES ---
 async def play_audio_chunks(text, model="piper", is_wake_word=False):
-    """
-    Trocea el texto y lo reproduce al instante. 
-    Llamada por module_main.py cuando el cerebro (LLM) tiene una respuesta.
-    """
-    if not voice:
-        queue_message("ERROR: El sistema vocal está desconectado.")
-        return
+    if not voice: return
 
-    # Trocear el texto por signos de puntuación (. ! ?) para no ahogar el procesador
-    chunks = re.split(r'(?<=[.!?])\s+', text)
+    # Trocear inteligentemente manteniendo los signos de puntuación
+    chunks = re.findall(r'[^.!?\n]+[.!?\n]*', text)
+    audio_queue = asyncio.Queue()
 
-    for chunk in chunks:
-        clean_chunk = chunk.strip()
-        if not clean_chunk: 
-            continue
-            
-        # 1. Sintetizar la frase en la RAM
-        wav_buffer = await synthesize(clean_chunk)
+    # TAREA 1: El Productor (El Cerebro)
+    async def producer():
+        for chunk in chunks:
+            clean_chunk = chunk.strip()
+            if clean_chunk:
+                # Usamos to_thread para que la CPU trabaje en la frase 2 mientras suena la 1
+                wav_buffer = await asyncio.to_thread(synthesize_sync, clean_chunk)
+                await audio_queue.put(wav_buffer)
         
-        # 2. Reproducir canalizando el audio directamente al altavoz (aplay)
-        try:
-            proceso = subprocess.Popen(
-                ["aplay", "-q"], 
-                stdin=subprocess.PIPE, 
-                stderr=subprocess.DEVNULL
-            )
-            # Volcamos los bytes de RAM directamente a la tarjeta de sonido
-            proceso.communicate(input=wav_buffer.read())
-        except Exception as e:
-            queue_message(f"Error de hardware reproduciendo audio: {e}")
+        # Le decimos al consumidor que ya no hay más frases
+        await audio_queue.put(None) 
+
+    # TAREA 2: El Consumidor (La Boca)
+    async def consumer():
+        while True:
+            wav_buffer = await audio_queue.get()
+            if wav_buffer is None: # Si recibe None, termina
+                break
+            
+            try:
+                # Usamos create_subprocess_exec para reproducir sin congelar el programa
+                proc = await asyncio.create_subprocess_exec(
+                    "aplay", "-q",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await proc.communicate(input=wav_buffer.read())
+            except Exception as e:
+                print(f"Error aplay: {e}")
+            
+            audio_queue.task_done()
+
+    # Lanzamos las dos tareas a la vez
+    await asyncio.gather(producer(), consumer())
 
 # --- 5. COMPATIBILIDAD CON APP.PY ---
-# Estas funciones evitan que el programa principal colapse buscando configuraciones antiguas.
-def update_tts_settings(*args, **kwargs):
-    queue_message("SYSTEM: Configuración de voz redirigida a Piper local.")
-    pass
-
-def initialize_manager_tts(*args, **kwargs):
-    queue_message("SYSTEM: TTS Manager local inicializado.")
-    pass
+def update_tts_settings(*args, **kwargs): pass
+def initialize_manager_tts(*args, **kwargs): pass
